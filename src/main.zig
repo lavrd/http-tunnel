@@ -44,8 +44,13 @@ pub fn main() !void {
         .thread_safe = true,
         .verbose_log = true,
     }){};
-    _ = gpa.allocator();
+    const allocator = gpa.allocator();
     defer std.debug.assert(gpa.deinit() == .ok);
+
+    const http_server_thread = try std.Thread.spawn(.{}, httpServer, .{
+        @as(std.mem.Allocator, allocator),
+        @as(u16, 14600),
+    });
 
     var act = std.posix.Sigaction{
         .handler = .{ .sigaction = handleSignal },
@@ -56,6 +61,9 @@ pub fn main() !void {
     try std.posix.sigaction(std.posix.SIG.INT, &act, &oact);
     waitSignalLoop();
 
+    // Waiting for other threads to be stopped.
+    http_server_thread.join();
+
     log.info("successfully exiting...", .{});
 }
 
@@ -63,6 +71,51 @@ fn waitSignalLoop() void {
     log.info("starting to wait for os signal", .{});
     _ = shouldWait(0);
     log.info("exiting os signal waiting loop", .{});
+}
+
+fn httpServer(allocator: std.mem.Allocator, port: u16) !void {
+    const address = std.net.Address.parseIp("0.0.0.0", port) catch unreachable;
+    var tcp_server = try address.listen(.{
+        .reuse_address = false,
+        .force_nonblocking = true,
+    });
+    defer tcp_server.deinit();
+    log.info("starting http server on {any}", .{address});
+
+    while (shouldWait(5)) {
+        const response = tcp_server.accept() catch |err| {
+            switch (err) {
+                error.WouldBlock => continue,
+                else => return,
+            }
+        };
+        var read_buffer: [1024]u8 = [_]u8{0} ** 1024;
+        var http_server = std.http.Server.init(response, &read_buffer);
+        switch (http_server.state) {
+            .ready => {},
+            else => continue,
+        }
+        var request = try http_server.receiveHead();
+
+        for (request.head.target) |byte| {
+            if (!std.ascii.isASCII(byte)) {
+                log.err("request target is no ascii: {any}", .{request.head.target});
+                continue;
+            }
+        }
+        const target = try std.ascii.allocLowerString(allocator, request.head.target);
+        log.debug("http request {s} {s}", .{
+            @tagName(request.head.method),
+            target,
+        });
+        allocator.free(target);
+
+        try request.respond(&[_]u8{}, .{
+            .status = std.http.Status.ok,
+        });
+    }
+
+    log.info("http server was stopped by os signal", .{});
 }
 
 fn shouldWait(ms: u64) bool {
