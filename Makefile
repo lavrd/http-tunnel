@@ -17,10 +17,18 @@ test: format
 test_one: format
 	zig test src/main.zig --test-filter $(name)
 
-run: build
-	zig-out/bin/http-tunnel
+run_client: build
+	zig-out/bin/http-tunnel "{\"side\":\"Client\"}"
 
-run_docker:
+run_server: build
+	zig-out/bin/http-tunnel "{\"side\":\"Server\"}"
+
+run_server_client:
 	docker run --rm -it \
 		--name http-tunnel \
-  	http-tunnel
+  	http-tunnel "{\"side\":\"Client\"}"
+
+run_server_docker:
+	docker run --rm -it \
+		--name http-tunnel \
+  	http-tunnel "{\"side\":\"Server\"}"

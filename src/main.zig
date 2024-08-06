@@ -15,6 +15,15 @@ var wait_signal = true;
 var wait_signal_mutex = std.Thread.Mutex{};
 var wait_signal_cond = std.Thread.Condition{};
 
+const Side = enum {
+    Client,
+    Server,
+};
+
+const Config = struct {
+    side: Side,
+};
+
 fn handleSignal(
     signal: i32,
     _: *const std.posix.siginfo_t,
@@ -47,10 +56,23 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer std.debug.assert(gpa.deinit() == .ok);
 
-    const http_server_thread = try std.Thread.spawn(.{}, httpServer, .{
-        @as(std.mem.Allocator, allocator),
-        @as(u16, 14600),
-    });
+    const config = try parseConfig(allocator);
+    log.info("starting as a {any}", .{config});
+
+    var http_server_thread: ?std.Thread = null;
+    var tcp_server_thread: ?std.Thread = null;
+    switch (config.side) {
+        Side.Client => {},
+        Side.Server => {
+            http_server_thread = try std.Thread.spawn(.{}, httpServer, .{
+                @as(std.mem.Allocator, allocator),
+                @as(u16, 14600),
+            });
+            tcp_server_thread = try std.Thread.spawn(.{}, tcpServer, .{
+                @as(u16, 22000),
+            });
+        },
+    }
 
     var act = std.posix.Sigaction{
         .handler = .{ .sigaction = handleSignal },
@@ -62,7 +84,8 @@ pub fn main() !void {
     waitSignalLoop();
 
     // Waiting for other threads to be stopped.
-    http_server_thread.join();
+    if (http_server_thread) |thread| thread.join();
+    if (tcp_server_thread) |thread| thread.join();
 
     log.info("successfully exiting...", .{});
 }
@@ -76,21 +99,21 @@ fn waitSignalLoop() void {
 fn httpServer(allocator: std.mem.Allocator, port: u16) !void {
     const address = std.net.Address.parseIp("0.0.0.0", port) catch unreachable;
     var tcp_server = try address.listen(.{
-        .reuse_address = false,
+        .reuse_address = true,
         .force_nonblocking = true,
     });
     defer tcp_server.deinit();
     log.info("starting http server on {any}", .{address});
 
     while (shouldWait(5)) {
-        const response = tcp_server.accept() catch |err| {
+        const conn = tcp_server.accept() catch |err| {
             switch (err) {
                 error.WouldBlock => continue,
                 else => return,
             }
         };
-        var read_buffer: [1024]u8 = [_]u8{0} ** 1024;
-        var http_server = std.http.Server.init(response, &read_buffer);
+        var buffer: [1024]u8 = [_]u8{0} ** 1024;
+        var http_server = std.http.Server.init(conn, &buffer);
         switch (http_server.state) {
             .ready => {},
             else => continue,
@@ -118,6 +141,50 @@ fn httpServer(allocator: std.mem.Allocator, port: u16) !void {
     log.info("http server was stopped by os signal", .{});
 }
 
+fn tcpServer(port: u16) !void {
+    const address = std.net.Address.parseIp("0.0.0.0", port) catch unreachable;
+    var tcp_server = try address.listen(.{
+        .reuse_address = true,
+        .force_nonblocking = true,
+    });
+    defer tcp_server.deinit();
+    log.info("starting tcp server on {any}", .{address});
+
+    main: while (shouldWait(5)) {
+        var conn: std.net.Server.Connection = undefined;
+        while (shouldWait(5)) {
+            conn = tcp_server.accept() catch |err| {
+                switch (err) {
+                    error.WouldBlock => continue,
+                    else => return,
+                }
+            };
+            break;
+        } else {
+            log.info("tcp server was stopped by os signal", .{});
+            return;
+        }
+        defer conn.stream.close();
+        log.info("new connection is established", .{});
+
+        var buffer: [1024]u8 = [_]u8{0} ** 1024;
+        while (shouldWait(5)) {
+            const n = conn.stream.read(&buffer) catch |err| {
+                switch (err) {
+                    error.WouldBlock => continue,
+                    else => return,
+                }
+            };
+            if (n == 0) {
+                log.info("tcp connection closed", .{});
+                continue :main;
+            }
+        }
+    }
+
+    log.info("tcp server was stopped by os signal", .{});
+}
+
 fn shouldWait(ms: u64) bool {
     wait_signal_mutex.lock();
     defer wait_signal_mutex.unlock();
@@ -132,6 +199,24 @@ fn shouldWait(ms: u64) bool {
         };
     }
     return wait_signal;
+}
+
+fn parseConfig(allocator: std.mem.Allocator) !Config {
+    var args = try std.process.ArgIterator.initWithAllocator(allocator);
+    defer args.deinit();
+    // Skip executable
+    _ = args.next();
+    if (args.next()) |arg| {
+        const config = try std.json.parseFromSlice(
+            Config,
+            allocator,
+            arg,
+            .{},
+        );
+        defer config.deinit();
+        return config.value;
+    }
+    return error.NoArgWithConfig;
 }
 
 fn logFn(
