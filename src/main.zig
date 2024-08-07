@@ -24,6 +24,15 @@ const Config = struct {
     side: Side,
 };
 
+const HTTPRequest = struct {
+    Method: std.http.Method,
+    Path: []const u8,
+};
+
+const HTTPResponse = struct {
+    Status: std.http.Status,
+};
+
 fn handleSignal(
     signal: i32,
     _: *const std.posix.siginfo_t,
@@ -34,6 +43,66 @@ fn handleSignal(
     defer wait_signal_mutex.unlock();
     wait_signal = false;
     wait_signal_cond.broadcast();
+}
+
+fn Channel(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        _raw: ?T,
+        _mutex: std.Thread.Mutex,
+        _cond: std.Thread.Condition,
+
+        fn Init(value: ?T) Self {
+            return .{
+                ._raw = value,
+                ._mutex = .{},
+                ._cond = .{},
+            };
+        }
+
+        fn send(self: *Self, data: T) void {
+            self._mutex.lock();
+            defer self._mutex.unlock();
+            self._raw = data;
+            self._cond.signal();
+        }
+
+        fn try_receive(
+            self: *Self,
+        ) ?T {
+            self._mutex.lock();
+            defer self._mutex.unlock();
+            return self._change();
+        }
+
+        fn receive(self: *Self) ?T {
+            self._mutex.lock();
+            defer self._mutex.unlock();
+            self._cond.wait(&self._mutex);
+            return self._change();
+        }
+
+        fn close(self: *Self) void {
+            self._mutex.lock();
+            defer self._mutex.unlock();
+            // Currently channel works like that:
+            // - If someone wait using "receive" function
+            // - And cond wakes up
+            // - And value in null
+            // - It means channel is closed.
+            self._raw = null;
+            self._cond.signal();
+        }
+
+        fn _change(self: *Self) ?T {
+            if (self._raw) |raw| {
+                self._raw = null;
+                return raw;
+            }
+            return null;
+        }
+    };
 }
 
 pub fn main() !void {
@@ -59,6 +128,9 @@ pub fn main() !void {
     const config = try parseConfig(allocator);
     log.info("starting as a {any}", .{config});
 
+    var req_ch = Channel(HTTPRequest).Init(null);
+    var res_ch = Channel(HTTPResponse).Init(null);
+
     var http_server_thread: ?std.Thread = null;
     var tcp_server_thread: ?std.Thread = null;
     switch (config.side) {
@@ -67,9 +139,14 @@ pub fn main() !void {
             http_server_thread = try std.Thread.spawn(.{}, httpServer, .{
                 @as(std.mem.Allocator, allocator),
                 @as(u16, 14600),
+                @as(*Channel(HTTPRequest), &req_ch),
+                @as(*Channel(HTTPResponse), &res_ch),
             });
             tcp_server_thread = try std.Thread.spawn(.{}, tcpServer, .{
+                @as(std.mem.Allocator, allocator),
                 @as(u16, 22000),
+                @as(*Channel(HTTPRequest), &req_ch),
+                @as(*Channel(HTTPResponse), &res_ch),
             });
         },
     }
@@ -96,7 +173,12 @@ fn waitSignalLoop() void {
     log.info("exiting os signal waiting loop", .{});
 }
 
-fn httpServer(allocator: std.mem.Allocator, port: u16) !void {
+fn httpServer(
+    allocator: std.mem.Allocator,
+    port: u16,
+    req_ch: *Channel(HTTPRequest),
+    res_ch: *Channel(HTTPResponse),
+) !void {
     const address = std.net.Address.parseIp("0.0.0.0", port) catch unreachable;
     var tcp_server = try address.listen(.{
         .reuse_address = true,
@@ -133,15 +215,31 @@ fn httpServer(allocator: std.mem.Allocator, port: u16) !void {
         });
         allocator.free(target);
 
-        try request.respond(&[_]u8{}, .{
-            .status = std.http.Status.ok,
+        // todo: is it possible to write to closed channel here?
+        req_ch.send(HTTPRequest{
+            .Method = request.head.method,
+            .Path = request.head.target,
         });
+        const response = res_ch.receive();
+        if (response) |res| {
+            try request.respond(&[_]u8{}, .{
+                .status = res.Status,
+            });
+            continue;
+        }
+        // It means channels were closed;
+        break;
     }
 
     log.info("http server was stopped by os signal", .{});
 }
 
-fn tcpServer(port: u16) !void {
+fn tcpServer(
+    allocator: std.mem.Allocator,
+    port: u16,
+    req_ch: *Channel(HTTPRequest),
+    res_ch: *Channel(HTTPResponse),
+) !void {
     const address = std.net.Address.parseIp("0.0.0.0", port) catch unreachable;
     var tcp_server = try address.listen(.{
         .reuse_address = true,
@@ -167,22 +265,39 @@ fn tcpServer(port: u16) !void {
         defer conn.stream.close();
         log.info("new connection is established", .{});
 
-        var buffer: [1024]u8 = [_]u8{0} ** 1024;
-        while (shouldWait(5)) {
-            const n = conn.stream.read(&buffer) catch |err| {
-                switch (err) {
-                    error.WouldBlock => continue,
-                    else => return,
+        const request = req_ch.receive();
+        if (request) |req| {
+            var json = std.ArrayList(u8).init(allocator);
+            try std.json.stringify(req, .{}, json.writer());
+            _ = try conn.stream.writeAll(json.items);
+
+            var buffer: [1024]u8 = [_]u8{0} ** 1024;
+            while (shouldWait(5)) {
+                const n = conn.stream.read(&buffer) catch |err| {
+                    switch (err) {
+                        error.WouldBlock => continue,
+                        else => return,
+                    }
+                };
+                if (n == 0) {
+                    log.info("tcp connection closed", .{});
+                    continue :main;
                 }
-            };
-            if (n == 0) {
-                log.info("tcp connection closed", .{});
-                continue :main;
+                res_ch.send(HTTPResponse{
+                    .Status = std.http.Status.teapot,
+                });
             }
         }
+        // It means channels were closed.
+        break;
     }
 
     log.info("tcp server was stopped by os signal", .{});
+}
+
+fn connectToServer() !void {
+    const address = try std.net.Address.parseIp4("172.0.0.2", 22000);
+    const conn = try std.net.tcpConnectToAddress(address);
 }
 
 fn shouldWait(ms: u64) bool {

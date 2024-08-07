@@ -23,12 +23,13 @@ run_client: build
 run_server: build
 	zig-out/bin/http-tunnel "{\"side\":\"Server\"}"
 
-run_server_client:
+run_client_docker:
 	docker run --rm -it \
-		--name http-tunnel \
+		--name http-tunnel-client \
   	http-tunnel "{\"side\":\"Client\"}"
 
 run_server_docker:
 	docker run --rm -it \
-		--name http-tunnel \
+		--name http-tunnel-server \
+		-p 14600:14600 \
   	http-tunnel "{\"side\":\"Server\"}"
